@@ -1,7 +1,7 @@
 aiogram==3.27.0
-python-dotenv
 fastapi
 uvicorn[standard]
+python-dotenv
 google-api-python-client
 google-auth
 google-auth-oauthlib
