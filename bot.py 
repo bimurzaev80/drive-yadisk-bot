@@ -1,0 +1,140 @@
+import os
+import io
+import tempfile
+from pathlib import Path
+
+from fastapi import FastAPI, Request
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.client.default import DefaultBotProperties
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleRequest
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+import yadisk
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+YANDEX_TOKEN = os.getenv("YANDEX_TOKEN")
+PUBLIC_URL = os.getenv("PUBLIC_URL")
+GOOGLE_CLIENT_SECRET_FILE = os.getenv("GOOGLE_CLIENT_SECRET_FILE", "credentials.json")
+GOOGLE_TOKEN_FILE = os.getenv("GOOGLE_TOKEN_FILE", "token.json")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret")
+
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher()
+app = FastAPI()
+
+
+def get_drive_service():
+    creds = None
+    if os.path.exists(GOOGLE_TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_FILE, SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(GoogleRequest())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(GOOGLE_CLIENT_SECRET_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(GOOGLE_TOKEN_FILE, "w") as token:
+            token.write(creds.to_json())
+
+    return build("drive", "v3", credentials=creds)
+
+
+def download_google_file(file_id: str, local_path: str):
+    service = get_drive_service()
+    request = service.files().get_media(fileId=file_id)
+    with open(local_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+
+
+def upload_to_yandex(local_path: str, yandex_path: str):
+    y = yadisk.YaDisk(token=YANDEX_TOKEN)
+    y.upload(local_path, yandex_path, overwrite=True)
+
+
+def download_from_yandex(yandex_path: str, local_path: str):
+    y = yadisk.YaDisk(token=YANDEX_TOKEN)
+    y.download(yandex_path, local_path)
+
+
+def upload_to_google(local_path: str, folder_id: str, filename: str):
+    service = get_drive_service()
+    media = MediaFileUpload(local_path, resumable=True)
+    body = {"name": filename, "parents": [folder_id]}
+    service.files().create(body=body, media_body=media, fields="id").execute()
+
+
+@dp.message(Command("start"))
+async def start(message: Message):
+    await message.answer(
+        "Привет. Я копирую файлы между Google Drive и Yandex Disk.\n\n"
+        "Команды:\n"
+        "/copy_gd_to_yd <gdrive_file_id> <yadisk_path>\n"
+        "/copy_yd_to_gd <yadisk_path> <gdrive_folder_id>"
+    )
+
+
+@dp.message(Command("copy_gd_to_yd"))
+async def copy_gd_to_yd(message: Message):
+    parts = message.text.split(maxsplit=2)
+    if len(parts) != 3:
+        await message.answer("Формат: /copy_gd_to_yd <gdrive_file_id> <yadisk_path>")
+        return
+
+    file_id = parts[1]
+    yandex_path = parts[2]
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "file.bin")
+            download_google_file(file_id, local_path)
+            upload_to_yandex(local_path, yandex_path)
+        await message.answer(f"Готово. Файл скопирован в Yandex Disk:\n<code>{yandex_path}</code>")
+    except Exception as e:
+        await message.answer(f"Ошибка: <code>{e}</code>")
+
+
+@dp.message(Command("copy_yd_to_gd"))
+async def copy_yd_to_gd(message: Message):
+    parts = message.text.split(maxsplit=2)
+    if len(parts) != 3:
+        await message.answer("Формат: /copy_yd_to_gd <yadisk_path> <gdrive_folder_id>")
+        return
+
+    yandex_path = parts[1]
+    folder_id = parts[2]
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, Path(yandex_path).name)
+            download_from_yandex(yandex_path, local_path)
+            upload_to_google(local_path, folder_id, Path(yandex_path).name)
+        await message.answer(f"Готово. Файл скопирован в Google Drive из:\n<code>{yandex_path}</code>")
+    except Exception as e:
+        await message.answer(f"Ошибка: <code>{e}</code>")
+
+
+@app.on_event("startup")
+async def on_startup():
+    if PUBLIC_URL:
+        await bot.set_webhook(
+            url=f"{PUBLIC_URL}/webhook",
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True,
+        )
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    update = types.Update.model_validate(await request.json(), context={"bot": bot})
+    await dp.feed_update(bot, update)
+    return {"ok": True}
